@@ -86,7 +86,7 @@ func (e *Renderer) Execute(ctx context.Context) (*fnresult.ResultList, error) {
 		runtime:       e.Runtime,
 	}
 
-	if _, err = hydrate(ctx, root, hctx); err != nil {
+	if _, err = hydrate(ctx, root, hctx, nil); err != nil {
 		// Note(droot): ignore the error in function result saving
 		// to avoid masking the hydration error.
 		// don't disable the CLI output in case of error
@@ -252,7 +252,7 @@ func (s hydrationState) String() string {
 }
 
 // hydrate hydrates given pkg and returns wet resources.
-func hydrate(ctx context.Context, pn *pkgNode, hctx *hydrationContext) (output []*yaml.RNode, err error) {
+func hydrate(ctx context.Context, pn *pkgNode, hctx *hydrationContext, inputFiles []*yaml.RNode) (output []*yaml.RNode, err error) {
 	const op errors.Op = "pkg.render"
 
 	curr, found := hctx.pkgs[pn.pkg.UniquePath]
@@ -282,46 +282,52 @@ func hydrate(ctx context.Context, pn *pkgNode, hctx *hydrationContext) (output [
 	}
 
 	var input []*yaml.RNode
-
-	// determine sub packages to be hydrated
-	subpkgs, err := curr.pkg.DirectSubpackages()
-	if err != nil {
-		return output, errors.E(op, curr.pkg.UniquePath, err)
-	}
-	// hydrate recursively and gather hydated transitive resources.
-	for _, subpkg := range subpkgs {
-		var transitiveResources []*yaml.RNode
-		var subPkgNode *pkgNode
-
-		if subPkgNode, err = newPkgNode(hctx.fileSystem, "", subpkg); err != nil {
-			return output, errors.E(op, subpkg.UniquePath, err)
-		}
-
-		transitiveResources, err = hydrate(ctx, subPkgNode, hctx)
+	if inputFiles != nil {
+		// if inputFiles are provided, it means we are hydrating a subpackage
+		input = append(input, inputFiles...)
+	} else {
+		subPkgResources, err := collectSubPkgResources(curr)
 		if err != nil {
-			return output, errors.E(op, subpkg.UniquePath, err)
+			return nil, errors.E(op, curr.pkg.UniquePath, err)
 		}
-
-		input = append(input, transitiveResources...)
+		input = append(input, subPkgResources...)
 	}
 
-	// gather resources present at the current package
-	currPkgResources, err := curr.pkg.LocalResources()
-	if err != nil {
-		return output, errors.E(op, curr.pkg.UniquePath, err)
+	//If current hydration is running against root package, track the input resources
+	//for all subpackages as well.
+	if curr.pkg.UniquePath.String() == hctx.root.pkg.UniquePath.String() {
+		err = trackInputFiles(hctx, relPath, input)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	err = trackInputFiles(hctx, relPath, currPkgResources)
-	if err != nil {
-		return nil, err
-	}
-
-	// include current package's resources in the input resource list
-	input = append(input, currPkgResources...)
-
+	//run pipeline on the current package
 	output, err = curr.runPipeline(ctx, hctx, input)
 	if err != nil {
 		return output, errors.E(op, curr.pkg.UniquePath, err)
+	}
+
+	//run hydration on all subpackages
+	subPkgs, err := curr.pkg.DirectSubpackages()
+	if err != nil {
+		return nil, errors.E(op, curr.pkg.UniquePath, err)
+	}
+	for _, subpkg := range subPkgs {
+		subPkgNode, err := newPkgNode(nil, "", subpkg)
+		if err != nil {
+			return nil, errors.E(op, curr.pkg.UniquePath, err)
+		}
+		subInputs, err := resourcesForSubPkg(input, subpkg)
+		if err != nil {
+			return nil, errors.E(op, curr.pkg.UniquePath, err)
+
+		}
+		subPkgResources, err := hydrate(ctx, subPkgNode, hctx, subInputs)
+		if err != nil {
+			return nil, errors.E(op, curr.pkg.UniquePath, err)
+		}
+		output = append(output, subPkgResources...)
 	}
 
 	// pkg is hydrated, mark the pkg as wet and update the resources
@@ -329,6 +335,47 @@ func hydrate(ctx context.Context, pn *pkgNode, hctx *hydrationContext) (output [
 	curr.resources = output
 
 	return output, err
+}
+
+func resourcesForSubPkg(resources []*yaml.RNode, subpkg *pkg.Pkg) ([]*yaml.RNode, error) {
+	output := []*yaml.RNode{}
+	for _, r := range resources {
+		path, _, err := kioutil.GetFileAnnotations(r)
+		if err != nil {
+			return nil, err
+		}
+		// if resource belongs to the subpackage, add it to the list
+		if strings.HasPrefix(path, subpkg.UniquePath.String()) {
+			output = append(output, r)
+		}
+	}
+	return output, nil
+}
+
+// Recursively collect all sub-resources for the given package.
+func collectSubPkgResources(pn *pkgNode) (output []*yaml.RNode, err error) {
+	subpkgs, err := pn.pkg.DirectSubpackages()
+	if err != nil {
+		return nil, err
+	}
+	for _, subpkg := range subpkgs {
+		subPkgNode, err := newPkgNode(nil, "", subpkg)
+		if err != nil {
+			return nil, err
+		}
+		subPkgResources, err := collectSubPkgResources(subPkgNode)
+		if err != nil {
+			return nil, err
+		}
+		output = append(output, subPkgResources...)
+	}
+	localResources, err := pn.pkg.LocalResources()
+	if err != nil {
+		return nil, err
+	}
+
+	output = append(output, localResources...)
+	return output, nil
 }
 
 // runPipeline runs the pipeline defined at current pkgNode on given input resources.
@@ -339,7 +386,6 @@ func (pn *pkgNode) runPipeline(ctx context.Context, hctx *hydrationContext, inpu
 	// package structure. We should have function to get the relative package
 	// path here.
 	pr.OptPrintf(printer.NewOpt().PkgDisplay(pn.pkg.DisplayPath), "\n")
-
 	pl, err := pn.pkg.Pipeline()
 	if err != nil {
 		return nil, err
